@@ -1,9 +1,27 @@
 import { query, type Options, type SDKAssistantMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { AgentBackend, AgentRequest, AgentResponse } from "../interface.js";
 import type { AppConfig } from "../../types.js";
 import { getSession, updateSession } from "../../storage/sessions.js";
 import { createHooks } from "./hooks.js";
 import { logger } from "../../util/logger.js";
+
+/** Read the current access token from ~/.claude/.credentials.json.
+ *  Falls back to the config token if the file is missing or unreadable.
+ *  This ensures we always use the latest token even after automatic refresh. */
+function readCurrentAuthToken(fallback: string): string {
+  try {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    const cred = JSON.parse(readFileSync(credPath, "utf-8"));
+    const token = cred?.claudeAiOauth?.accessToken;
+    if (token) return token;
+  } catch {
+    // file missing or invalid – fall back to config value
+  }
+  return fallback;
+}
 
 function extractText(msg: SDKAssistantMessage): string {
   const parts: string[] = [];
@@ -38,7 +56,7 @@ export class ClaudeBackend implements AgentBackend {
       env: {
         ...process.env,
         ANTHROPIC_BASE_URL: this.config.anthropicBaseUrl,
-        ANTHROPIC_AUTH_TOKEN: this.config.anthropicAuthToken,
+        ANTHROPIC_AUTH_TOKEN: readCurrentAuthToken(this.config.anthropicAuthToken),
       },
       maxTurns: 30,
     };

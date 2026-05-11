@@ -1,8 +1,13 @@
-import type { WeixinMessage } from "../wechat/types.js";
+import { writeFile, unlink, access, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, extname } from "node:path";
+import type { WeixinMessage, MessageItem } from "../wechat/types.js";
 import { MessageType, MessageItemType, TypingStatus } from "../wechat/types.js";
 import { sendTyping } from "../wechat/api.js";
 import type { WeixinApiOptions } from "../wechat/api.js";
 import { sendTextMessage, markdownToPlainText } from "../wechat/send.js";
+import { sendImage, sendFile } from "../wechat/send-media.js";
+import { downloadImage, downloadFile, downloadVideo } from "../media/download.js";
 import { setContextToken, getContextToken } from "../wechat/context-token.js";
 import { getAgent, getRegisteredTypes } from "../agent/registry.js";
 import { getOrCreateSession, updateSession, resetAgentSession } from "../storage/sessions.js";
@@ -15,6 +20,98 @@ import { redactUserId } from "../util/redact.js";
 import { buildConversationKey, type AgentType, type AppConfig } from "../types.js";
 
 const TYPING_INTERVAL_MS = 10_000;
+
+// Regex to detect image/file paths in Claude's response text
+const OUTGOING_IMAGE_REGEX = /((?:\/|~\/)[^\s"'`，。！？,!?]+\.(?:png|jpg|jpeg|gif|webp|bmp))/gi;
+const OUTGOING_FILE_REGEX = /((?:\/|~\/)[^\s"'`，。！？,!?]+\.(?:pdf|doc|docx|xls|xlsx|csv|txt|zip))/gi;
+
+/** Save a buffer to a temp file, returns the temp path */
+async function saveMediaToTemp(data: Buffer, ext: string): Promise<string> {
+  const tmpPath = join(tmpdir(), `wechat-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
+  await writeFile(tmpPath, data);
+  return tmpPath;
+}
+
+/** Download all media items from an incoming message, save to temp files.
+ *  Returns a prompt suffix describing the attachments and a list of temp paths to clean up. */
+async function buildMediaPrompt(mediaItems: MessageItem[]): Promise<{ promptSuffix: string; tempFiles: string[] }> {
+  const tempFiles: string[] = [];
+  const lines: string[] = [];
+
+  for (const item of mediaItems) {
+    try {
+      if (item.type === MessageItemType.IMAGE && item.image_item) {
+        const data = await downloadImage(item.image_item);
+        if (data) {
+          const tmpPath = await saveMediaToTemp(data, "jpg");
+          tempFiles.push(tmpPath);
+          lines.push(`[用户发送了一张图片，已保存至 ${tmpPath}，请用 Read 工具查看并分析]`);
+        }
+      } else if (item.type === MessageItemType.FILE && item.file_item) {
+        const data = await downloadFile(item.file_item);
+        if (data) {
+          const fileName = item.file_item.file_name ?? `file_${Date.now()}`;
+          const ext = extname(fileName).replace(".", "") || "bin";
+          const tmpPath = await saveMediaToTemp(data, ext);
+          tempFiles.push(tmpPath);
+          lines.push(`[用户发送了文件 "${fileName}"，已保存至 ${tmpPath}，请用 Read 工具查看]`);
+        }
+      } else if (item.type === MessageItemType.VIDEO && item.video_item) {
+        const data = await downloadVideo(item.video_item);
+        if (data) {
+          const tmpPath = await saveMediaToTemp(data, "mp4");
+          tempFiles.push(tmpPath);
+          lines.push(`[用户发送了视频，已保存至 ${tmpPath}]`);
+        }
+      }
+    } catch (err) {
+      logger.error(`Failed to download media item type=${item.type}: ${String(err)}`);
+    }
+  }
+
+  return { promptSuffix: lines.join("\n"), tempFiles };
+}
+
+/** Scan Claude's response text for image/file paths and send them back to the user via WeChat. */
+async function sendMediaFromResponse(
+  accountId: string,
+  apiOpts: WeixinApiOptions,
+  userId: string,
+  responseText: string,
+): Promise<void> {
+  const home = process.env.HOME ?? "";
+
+  const imagePaths = [...new Set([...(responseText.match(OUTGOING_IMAGE_REGEX) ?? [])])];
+  logger.info(`sendMediaFromResponse: found ${imagePaths.length} image path(s): ${imagePaths.join(", ")}`);
+  for (const rawPath of imagePaths) {
+    const filePath = rawPath.startsWith("~/") ? rawPath.replace("~", home) : rawPath;
+    try {
+      await access(filePath);
+      const data = await readFile(filePath);
+      logger.info(`Sending image size=${data.length} path=${filePath}`);
+      await sendImage(apiOpts, accountId, userId, data);
+      logger.info(`Sent image to user=${redactUserId(userId)} path=${filePath}`);
+    } catch (err) {
+      logger.error(`Failed to send image path=${filePath}: ${String(err)}`);
+    }
+  }
+
+  const filePaths = [...new Set([...(responseText.match(OUTGOING_FILE_REGEX) ?? [])])];
+  logger.info(`sendMediaFromResponse: found ${filePaths.length} file path(s): ${filePaths.join(", ")}`);
+  for (const rawPath of filePaths) {
+    const filePath = rawPath.startsWith("~/") ? rawPath.replace("~", home) : rawPath;
+    const fileName = filePath.split("/").pop() ?? "file";
+    try {
+      await access(filePath);
+      const data = await readFile(filePath);
+      logger.info(`Sending file size=${data.length} name=${fileName} path=${filePath}`);
+      await sendFile(apiOpts, accountId, userId, data, fileName);
+      logger.info(`Sent file to user=${redactUserId(userId)} path=${filePath}`);
+    } catch (err) {
+      logger.error(`Failed to send file path=${filePath}: ${String(err)}`);
+    }
+  }
+}
 
 export interface DispatcherDeps {
   config: AppConfig;
@@ -46,9 +143,9 @@ export function createDispatcher(deps: DispatcherDeps) {
       setContextToken(accountId, userId, msg.context_token);
     }
 
-    // Extract text
-    const text = extractText(msg);
-    if (!text) return;
+    // Extract text + media
+    const { text, mediaItems } = extractContent(msg);
+    if (!text && mediaItems.length === 0) return;
 
     // Allowlist check
     if (!isUserAllowed(userId)) {
@@ -56,7 +153,7 @@ export function createDispatcher(deps: DispatcherDeps) {
       return;
     }
 
-    logger.info(`Message from=${redactUserId(userId)} len=${text.length}`);
+    logger.info(`Message from=${redactUserId(userId)} len=${text.length} media=${mediaItems.length}`);
 
     // Parse commands
     const trimmed = text.trim();
@@ -81,6 +178,10 @@ export function createDispatcher(deps: DispatcherDeps) {
       case "/cwd":
         await handleCwd(accountId, apiOpts, userId, conversationKey, trimmed.slice(4).trim());
         return;
+      case "/sendfile":
+      case "/sendimage":
+        await handleSendFile(accountId, apiOpts, userId, trimmed.split(/\s+/).slice(1).join(" ").trim());
+        return;
       case "/login":
         await handleLogin(accountId, apiOpts, userId);
         return;
@@ -98,10 +199,14 @@ export function createDispatcher(deps: DispatcherDeps) {
     startTypingLoop(apiOpts, userId, typingTicket, typingController.signal);
 
     try {
+      // Download incoming media attachments and build prompt suffix
+      const { promptSuffix, tempFiles } = await buildMediaPrompt(mediaItems);
+      const fullPrompt = promptSuffix ? `${trimmed}\n${promptSuffix}`.trim() : trimmed;
+
       const agent = getAgent(agentType);
       const result = await agent.run({
         userId: conversationKey,
-        prompt: trimmed,
+        prompt: fullPrompt,
         cwd: session.cwd,
       });
 
@@ -112,6 +217,12 @@ export function createDispatcher(deps: DispatcherDeps) {
       const chunks = chunkText(plainText, config.textChunkLimit);
 
       await sendChunks(accountId, apiOpts, userId, chunks);
+
+      // Send any image/file paths found in Claude's response back to the user
+      await sendMediaFromResponse(accountId, apiOpts, userId, result.text);
+
+      // Clean up temp files created from incoming media
+      await Promise.allSettled(tempFiles.map((f) => unlink(f)));
     } catch (err) {
       typingController.abort();
       logger.error(`Agent error for user=${redactUserId(userId)}: ${String(err)}`);
@@ -196,6 +307,7 @@ export function createDispatcher(deps: DispatcherDeps) {
       "  /status - Show current status",
       "  /help - Show this help",
       "  /cwd <path> - Change working directory",
+      "  /sendfile <path> - Send a file/image directly to yourself",
       loginHelp,
       logoutHelp,
       "",
@@ -262,6 +374,46 @@ export function createDispatcher(deps: DispatcherDeps) {
         userId,
         `Failed to add bot account: ${String(err)}`,
       );
+    }
+  }
+
+  async function handleSendFile(
+    accountId: string,
+    apiOpts: WeixinApiOptions,
+    userId: string,
+    filePath: string,
+  ): Promise<void> {
+    if (!filePath) {
+      await sendReply(
+        accountId,
+        apiOpts,
+        userId,
+        "用法: /sendfile <路径>\n示例: /sendfile /mnt/c/Users/lymor/Desktop/1.png",
+      );
+      return;
+    }
+
+    const home = process.env.HOME ?? "";
+    const resolvedPath = filePath.startsWith("~/") ? filePath.replace("~", home) : filePath;
+    const ext = resolvedPath.split(".").pop()?.toLowerCase() ?? "";
+    const imageExts = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+    logger.info(`handleSendFile: path=${resolvedPath} user=${redactUserId(userId)}`);
+
+    try {
+      const data = await readFile(resolvedPath);
+      if (imageExts.includes(ext)) {
+        await sendImage(apiOpts, accountId, userId, data);
+        logger.info(`handleSendFile: sent image size=${data.length} to=${redactUserId(userId)}`);
+      } else {
+        const fileName = resolvedPath.split("/").pop() ?? "file";
+        await sendFile(apiOpts, accountId, userId, data, fileName);
+        logger.info(`handleSendFile: sent file name=${fileName} size=${data.length} to=${redactUserId(userId)}`);
+      }
+      await sendReply(accountId, apiOpts, userId, `✅ 已发送: ${resolvedPath}`);
+    } catch (err) {
+      logger.error(`handleSendFile failed path=${resolvedPath}: ${String(err)}`);
+      await sendReply(accountId, apiOpts, userId, `❌ 发送失败: ${String(err)}`);
     }
   }
 
@@ -384,12 +536,20 @@ export function createDispatcher(deps: DispatcherDeps) {
   }
 }
 
-function extractText(msg: WeixinMessage): string {
-  if (!msg.item_list?.length) return "";
+function extractContent(msg: WeixinMessage): { text: string; mediaItems: MessageItem[] } {
+  if (!msg.item_list?.length) return { text: "", mediaItems: [] };
+  let text = "";
+  const mediaItems: MessageItem[] = [];
   for (const item of msg.item_list) {
     if (item.type === MessageItemType.TEXT && item.text_item?.text) {
-      return item.text_item.text;
+      text = item.text_item.text;
+    } else if (
+      item.type === MessageItemType.IMAGE ||
+      item.type === MessageItemType.FILE ||
+      item.type === MessageItemType.VIDEO
+    ) {
+      mediaItems.push(item);
     }
   }
-  return "";
+  return { text, mediaItems };
 }

@@ -48,7 +48,16 @@ export function loadConfig(): AppConfig {
   }
 
   const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || "";
-  const anthropicAuthToken = process.env.ANTHROPIC_AUTH_TOKEN || "";
+  let anthropicAuthToken = process.env.ANTHROPIC_AUTH_TOKEN || "";
+  if (!anthropicAuthToken) {
+    try {
+      const credPath = path.join(os.homedir(), ".claude", ".credentials.json");
+      const cred = JSON.parse(fs.readFileSync(credPath, "utf-8"));
+      anthropicAuthToken = cred?.claudeAiOauth?.accessToken || "";
+    } catch {
+      // credentials file not found or invalid, leave token empty
+    }
+  }
   const allowedUsers = fileConfig.allowedUsers ?? parseUserList(process.env.ALLOWED_USERS) ?? [];
   const adminUsers = fileConfig.adminUsers ?? parseUserList(process.env.ADMIN_USERS) ?? [];
 

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { aesEcbEncrypt, aesEcbPaddedSize, generateAesKey } from "./aes-ecb.js";
-import { cdnUpload } from "./cdn-upload.js";
+import { cdnUpload, cdnUploadWithUrl } from "./cdn-upload.js";
 import { randomHex } from "../util/random.js";
 import { getUploadUrl, buildBaseInfo } from "../wechat/api.js";
 import type { WeixinApiOptions } from "../wechat/api.js";
@@ -45,12 +45,15 @@ export async function uploadFile(
     },
   });
 
-  if (!uploadResp.upload_param) {
-    throw new Error("No upload_param in getUploadUrl response");
+  if (!uploadResp.upload_param && !uploadResp.upload_full_url) {
+    logger.error(`getUploadUrl failed response: ${JSON.stringify(uploadResp)}`);
+    throw new Error("No upload_param or upload_full_url in getUploadUrl response");
   }
 
   const ciphertext = aesEcbEncrypt(data, aesKey);
-  const downloadParam = await cdnUpload(uploadResp.upload_param, filekey, ciphertext);
+  const downloadParam = uploadResp.upload_full_url
+    ? await cdnUploadWithUrl(uploadResp.upload_full_url, ciphertext)
+    : await cdnUpload(uploadResp.upload_param!, filekey, ciphertext);
 
   return {
     filekey,
