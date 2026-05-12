@@ -7,7 +7,8 @@
   },
   "codex": {
     "sandboxMode": "danger-full-access",
-    "workingDirectory": "."
+    "workingDirectory": ".",
+    "home": "~/.codex"
   },
   "stateDir": "~/.wechat-agents",
   "allowedUsers": [],

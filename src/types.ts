@@ -21,6 +21,7 @@ export interface AppConfig {
     model?: string;
     sandboxMode?: string;
     workingDirectory: string;
+    home?: string;
   };
   stateDir: string;
   allowedUsers: string[];

@@ -22,6 +22,7 @@ interface FileConfig {
     model?: string;
     sandboxMode?: string;
     workingDirectory?: string;
+    home?: string;
   };
   stateDir?: string;
   allowedUsers?: string[];
@@ -74,6 +75,7 @@ export function loadConfig(): AppConfig {
       model: fileConfig.codex?.model,
       sandboxMode: fileConfig.codex?.sandboxMode || "danger-full-access",
       workingDirectory: resolvePath(fileConfig.codex?.workingDirectory || "."),
+      home: fileConfig.codex?.home ? resolvePath(fileConfig.codex.home) : process.env.CODEX_HOME,
     },
     stateDir: resolvePath(fileConfig.stateDir || "~/.wechat-agents"),
     allowedUsers,
